@@ -168,7 +168,9 @@ void Joystick::set_axis(int axis, float value)
     std::lock_guard<std::mutex> lock(_state_mutex);
 
     // Scale and clamp between 1 and -1.
-    _state.axes[axis] = std::max(std::min(value / 32767.f, 1.f), -1.f);
+    float temp = std::max(std::min(value / 32767.f, 1.f), -1.f);
+    _state.axes[axis] = temp; //std::max(std::min(value / 32767.f, 1.f), -1.f);
+    std::cout << "axis: " << axis << " value: " <<  temp <<"\n";
 }
 
 float Joystick::get_axis(unsigned axis)

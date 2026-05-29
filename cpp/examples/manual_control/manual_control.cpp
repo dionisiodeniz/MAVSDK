@@ -24,17 +24,31 @@ using std::chrono::milliseconds;
 using std::this_thread::sleep_for;
 
 // This config works for Logitech Extreme 3D Pro
+// struct JoystickMapping {
+//     int roll_axis = 0;
+//     int pitch_axis = 1;
+//     int yaw_axis = 2;
+//     int throttle_axis = 3;
+
+//     bool roll_inverted = false;
+//     bool pitch_inverted = true;
+//     bool yaw_inverted = false;
+//     bool throttle_inverted = true;
+// } joystick_mapping{};
+
+// Mapping for Logitech Gamepad F310
 struct JoystickMapping {
-    int roll_axis = 0;
-    int pitch_axis = 1;
-    int yaw_axis = 2;
-    int throttle_axis = 3;
+    int roll_axis = 3;
+    int pitch_axis = 4;
+    int yaw_axis = 0;
+    int throttle_axis = 1;
 
     bool roll_inverted = false;
     bool pitch_inverted = true;
     bool yaw_inverted = false;
     bool throttle_inverted = true;
 } joystick_mapping{};
+
 
 void usage(const std::string& bin_name)
 {
