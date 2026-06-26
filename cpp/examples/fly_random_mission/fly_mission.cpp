@@ -28,6 +28,7 @@ DM26-0076
 #include <future>
 #include <iostream>
 #include <thread>
+#include <cstring>
 
 #include <cmath>
 #include <iomanip>
@@ -125,7 +126,7 @@ Mission::MissionItem make_mission_item(
 
 void usage(const std::string& bin_name)
 {
-    std::cerr << "Usage : " << bin_name << " <connection_url> <num mission rounds>\n"
+    std::cerr << "Usage : " << bin_name << " <connection_url>  [missionrounds=<int> roundlength=<int> addlanding=y maxturnshift=<degrees>]\n"
               << "Connection URL format should be :\n"
               << " For TCP server: tcpin://<our_ip>:<port>\n"
               << " For TCP client: tcpout://<remote_ip>:<port>\n"
@@ -135,16 +136,44 @@ void usage(const std::string& bin_name)
               << "For example, to connect to the simulator use URL: udpin://0.0.0.0:14540\n";
 }
 
+struct params_t {
+    int missionrounds;
+    int roundlength;
+    bool addlanding;
+    int maxturnshift;
+} params;
+
 int main(int argc, char** argv)
 {
-    int missionrounds=0;
+    params.missionrounds=1;
+    params.roundlength=10;
+    params.addlanding = false;
+    params.maxturnshift = 30;
 
-    if (argc != 3) {
+    if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    missionrounds = atoi(argv[2]);
+    if (argc >3){
+        for (int i=2 ; i<argc; i++){
+            char *name = std::strtok(argv[i],"=") ;
+            char *value = std::strtok(nullptr,"=");
+            if (value != nullptr && name != nullptr){
+                if (std::strcmp(name,"missionrounds")==0){
+                    params.missionrounds = atoi(value);
+                } else if (std::strcmp(name,"roundlength")==0){
+                    params.roundlength = atoi(value);
+                } else if (std::strcmp(name,"addlanding")==0){
+                    if (value[0] == 'y' || value[0] == 'Y'){
+                        params.addlanding = true;
+                    }
+                } else if (std::strcmp(name,"maxturnshift")==0){
+                    params.maxturnshift = atoi(value);
+                }
+            }
+        }
+    }
 
     Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
     ConnectionResult connection_result = mavsdk.add_any_connection(argv[1]);
@@ -197,7 +226,8 @@ int main(int argc, char** argv)
 
     std::random_device rd; 
     std::mt19937 gen(rd()); 
-    std::uniform_real_distribution<double> dis(0.0, 1.0); 
+    std::uniform_real_distribution<double> dis(0.0, 1.0);
+    std::uniform_int_distribution<int> disbin(0,1); 
     //double random_val = dis(gen);
 
 
@@ -207,9 +237,11 @@ int main(int argc, char** argv)
     prevPoint.lon = initial_position.longitude_deg;
 
     double direction = 90.0;// due east
+    double difDirection=0.0;
+    int leftrightturn=1; // 1 = left, -1 = right
 
     double minDirection = 0.0;
-    double maxDirection = 180;
+    double maxDirection = 360.0;
 
     std::cout << "Commanding takeoff...\n";
     const Action::Result takeoff_result = action.takeoff(); 
@@ -220,25 +252,33 @@ int main(int argc, char** argv)
     std::cout << "Commanded takeoff.\n";
 
 
-    for (int j=0;j<missionrounds;j++){
+    for (int j=0;j<params.missionrounds;j++){
 
         mission_items.clear();
 
-        if ((j % 2) == 0){
-            minDirection = 0.0;
-            maxDirection = 180;
-        } else {
-            minDirection = 180.0;
-            maxDirection = 360.0;
-        }
+        // if ((j % 2) == 0){
+        //     minDirection = 0.0;
+        //     maxDirection = 180;
+        // } else {
+        //     minDirection = 180.0;
+        //     maxDirection = 360.0;
+        // }
 
-        for (int i=0;i<10;i++){
+        for (int i=0;i<params.roundlength;i++){
 
             // to generate a Browninan motion (random walk) we generate the direction
             // based on the uniform distribution
-            direction = ((maxDirection - minDirection) * dis(gen)) + minDirection;
+            leftrightturn = disbin(gen);
+            difDirection = (params.maxturnshift * dis(gen));
+            difDirection = (leftrightturn == 0 ? -1 : 1) * difDirection;
+            direction = direction + difDirection; //((maxDirection - minDirection) * dis(gen)) + minDirection;
+            if (direction > 360) {
+                direction = direction - 360.0;
+            } else if (direction <0){
+                direction=direction * -1;
+            }
 
-            mission_items.push_back(make_mission_item(
+            auto item = make_mission_item(
                 prevPoint.lat,
                 prevPoint.lon,
                 10.0f,
@@ -246,7 +286,16 @@ int main(int argc, char** argv)
                 true,//false, // fly through
                 20.0f,
                 60.0f,
-                Mission::MissionItem::CameraAction::None));
+                Mission::MissionItem::CameraAction::None);
+
+            // add landing to the last item if requested
+            if (i == (params.roundlength -1)  && j == (params.missionrounds-1) && params.addlanding){
+                item.vehicle_action = Mission::MissionItem::VehicleAction::Land;
+                std::cout<<"Added landing to mission\n";
+            }
+
+            mission_items.push_back(item);
+
             nextPoint = project_point(
                 prevPoint.lat, 
                 prevPoint.lon, 
@@ -277,6 +326,7 @@ int main(int argc, char** argv)
         std::cout << "Uploading mission...\n";
         Mission::MissionPlan mission_plan{};
         mission_plan.mission_items = mission_items;
+
         const Mission::Result upload_result = mission.upload_mission(mission_plan);
 
         if (upload_result != Mission::Result::Success) {
