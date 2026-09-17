@@ -19,9 +19,12 @@ DM26-0076
 //
 
 #include <mavsdk/mavsdk.hpp>
+#include <mavsdk/plugins/shell/shell.hpp>
 #include <mavsdk/plugins/action/action.hpp>
 #include <mavsdk/plugins/mission/mission.hpp>
 #include <mavsdk/plugins/telemetry/telemetry.hpp>
+#include <mavsdk/plugins/param/param.hpp>
+
 
 #include <chrono>
 #include <functional>
@@ -35,10 +38,26 @@ DM26-0076
 
 #include <random>
 
+#include <csignal>
+#include <atomic>
+#include <unistd.h>
+
+
 
 using namespace mavsdk;
 using std::chrono::seconds;
 using std::this_thread::sleep_for;
+
+std::atomic<bool> keepRunning(true);
+
+// The signal handler function executed when Ctrl-C is pressed
+void signalHandler(int signum) {
+    std::cout << "\n[Signal] Captured Ctrl-C (Signal number: " << signum << ")\n";
+    
+    // Set flag to false to break out of any processing loops safely
+    keepRunning = false; 
+}
+
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -141,6 +160,7 @@ struct params_t {
     int roundlength;
     bool addlanding;
     int maxturnshift;
+    bool shutdown;
 } params;
 
 int main(int argc, char** argv)
@@ -149,6 +169,7 @@ int main(int argc, char** argv)
     params.roundlength=10;
     params.addlanding = false;
     params.maxturnshift = 30;
+    params.shutdown = false;
 
     if (argc < 2) {
         usage(argv[0]);
@@ -170,9 +191,29 @@ int main(int argc, char** argv)
                     }
                 } else if (std::strcmp(name,"maxturnshift")==0){
                     params.maxturnshift = atoi(value);
+                } else if (std::strcmp(name,"shutdown")==0){
+                    params.shutdown= true;
                 }
             }
         }
+    }
+
+    // Setup the Ctl-C interrupt handler
+    struct sigaction sigIntHandler;
+
+    // Direct incoming SIGINT signals to our custom handler function
+    sigIntHandler.sa_handler = signalHandler;
+    
+    // Clear any active masking options during the signal handling process
+    sigemptyset(&sigIntHandler.sa_mask);
+    
+    // Set option flags to 0 for standard signal response behavior
+    sigIntHandler.sa_flags = 0;
+
+    // Bind our configuration to the SIGINT (Ctrl-C) event
+    if (sigaction(SIGINT, &sigIntHandler, nullptr) == -1) {
+        std::cerr << "Error registering signal handler." << std::endl;
+        return 1;
     }
 
     Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
@@ -193,8 +234,61 @@ int main(int argc, char** argv)
     auto mission = Mission{system.value()};
     auto telemetry = Telemetry{system.value()};
 
+    // reduce workload of telemetry
+    telemetry.set_rate_position(1.0);
+    telemetry.set_rate_imu(1.0);
+
+    auto shell = Shell{system.value()};
+
+    // disable the max first waypoint warning
+    auto param = Param(system.value());
+    Param::Result result = param.set_param_float("MIS_DIST_1WP",0);
+
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully updated MIS_DIST_1WP !\n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+
+    // disable battery draining
+    result = param.set_param_float("SIM_BAT_DRAIN",0);
+
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully disabled battery draining !\n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+
+    // Disable the magnetometer gate breaker to void errors like "magnetic interference"
+    result = param.set_param_int("COM_ARM_MAG_STR",0);
+
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully disabled magnetometer breaker \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+
+    result = param.set_param_int("NAV_DLL_ACT",0);
+
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully disabled waiting for ground control station \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+
+    // ALLOW ARMING WITHOUT GPS
+    // result = param.set_param_int("COM_ARM_WO_GPS",1);
+
+    // if (result == Param::Result::Success) {
+    //     std::cout << "Successfully enabled arming without GPS \n";
+    // } else {
+    //     std::cerr << "Failed to set parameter: " << result << '\n';
+    // }
+
+
     int i=0;
     while (!telemetry.health_all_ok() && i<5) {
+    //while (!telemetry.health().is_armable && i <10){
         std::cout << "Waiting for system to be ready\n";
         sleep_for(seconds(1));
         i++;
@@ -203,12 +297,11 @@ int main(int argc, char** argv)
     mavsdk::Telemetry::Position initial_position; 
 
     if (telemetry.health_all_ok()){
+    //if (telemetry.health().is_armable){
         auto origin_result = telemetry.get_gps_global_origin();
         if (origin_result.first == Telemetry::Result::Success) {
             std::cout << "Initial GPS origin: " << origin_result.second << '\n';
         }
-
-
 
         // Get initial position
         initial_position = telemetry.position();
@@ -218,6 +311,14 @@ int main(int argc, char** argv)
         initial_position.longitude_deg = 8.5456490218639658;
     }
 
+
+
+
+    // // Define the desired delay to loitering (-1)
+    // const std::string param_name = "RTL_DESCEND_DELAY";
+    // const float delay_seconds = -1.0f;
+    // Set the parameter (this is a blocking call)
+    // Param::Result result = param.set_param_float(param_name, delay_seconds);
 
     std::cout << "System ready\n";
     std::cout << "Creating and uploading mission\n";
@@ -247,15 +348,30 @@ int main(int argc, char** argv)
     const Action::Result takeoff_result = action.takeoff(); 
     if (takeoff_result != Action::Result::Success) {
         std::cout << "Failed to command takeoff: " << takeoff_result << '\n';
-        return 1;
+        std::cout << "\tThe program will exit after resetting parameters. Try again after that. \n\tIf this fails:\n";
+        std::cout << "\tTry Running QGroundControl and \n";
+        std::cout << "\tgo to Configure->Parameters->SITL\n";
+        std::cout << "\tPress the 'Tools' button  and select\n";
+        std::cout << "\t'reset all to firmware defaults'\n";
+        shell.send("param reset_all");
+        sleep_for(seconds(1));
+        shell.send("param save");
+        sleep_for(seconds(1));
+        action.reboot();
+        return -1;
     }
     std::cout << "Commanded takeoff.\n";
 
+    bool first_time=true;
 
-    for (int j=0;j<params.missionrounds;j++){
+
+    for (int j=0;j<params.missionrounds && keepRunning;j++){
+
+        std::cout << "Mission round: " << j <<"\n";
 
         mission_items.clear();
 
+        // try to keep it close to the launch point
         // if ((j % 2) == 0){
         //     minDirection = 0.0;
         //     maxDirection = 180;
@@ -264,7 +380,13 @@ int main(int argc, char** argv)
         //     maxDirection = 360.0;
         // }
 
-        for (int i=0;i<params.roundlength;i++){
+        if ((j%2) == 0){
+            direction = 90.0; //due east
+        } else {
+            direction = 270.0; // due west
+        }
+
+        for (int i=0;i<params.roundlength && keepRunning;i++){
 
             // to generate a Browninan motion (random walk) we generate the direction
             // based on the uniform distribution
@@ -305,22 +427,6 @@ int main(int argc, char** argv)
             prevPoint = nextPoint;
         }
 
-        // This is for testing whether we can add a landing action to a fixed-wing vehicle mission
-        /*
-        mavsdk::Mission::MissionItem landingItem = make_mission_item(
-                prevPoint.lat,
-                prevPoint.lon,
-                10.0f,
-                5.0f,
-                true,//false, // fly through
-                20.0f,
-                60.0f,
-                Mission::MissionItem::CameraAction::None);
-        landingItem.vehicle_action = Mission::MissionItem::VehicleAction::Land;
-
-        mission_items.push_back(landingItem);
-        */
-
     // repeat mission multiple times 
     // we should later generate multiple missions and execute them as well
         std::cout << "Uploading mission...\n";
@@ -331,51 +437,111 @@ int main(int argc, char** argv)
 
         if (upload_result != Mission::Result::Success) {
             std::cerr << "Mission upload failed: " << upload_result << ", exiting.\n";
-            return 1;
+            return -1;
         }
 
-        std::cout << "Arming...\n";
-        const Action::Result arm_result = action.arm();
-        if (arm_result != Action::Result::Success) {
-            std::cerr << "Arming failed: " << arm_result << '\n';
-            return 1;
-        }
-        std::cout << "Armed.\n";
+        if (first_time){
+            first_time = false;
+            std::cout << "Arming...\n";
+            const Action::Result arm_result = action.arm();
+            if (arm_result != Action::Result::Success) {
+                std::cerr << "Arming failed: " << arm_result << '\n';
+                return -1;
+            }
+            std::cout << "Armed.\n";
+        //}
+        
+            std::atomic<bool> want_to_pause{false};
+            // Before starting the mission, we want to be sure to subscribe to the mission progress.
+            mission.subscribe_mission_progress([&want_to_pause](Mission::MissionProgress mission_progress) {
+                std::cout << "Mission status update: " << mission_progress.current << " / "
+                        << mission_progress.total << '\n';
+            });
 
-        std::atomic<bool> want_to_pause{false};
-        // Before starting the mission, we want to be sure to subscribe to the mission progress.
-        mission.subscribe_mission_progress([&want_to_pause](Mission::MissionProgress mission_progress) {
-            std::cout << "Mission status update: " << mission_progress.current << " / "
-                    << mission_progress.total << '\n';
-        });
+        }
 
         Mission::Result start_mission_result = mission.start_mission();
         if (start_mission_result != Mission::Result::Success) {
             std::cerr << "Starting mission failed: " << start_mission_result << '\n';
-            return 1;
+            return -1;
         }
 
         while (!mission.is_mission_finished().second) {
+            if (!keepRunning){
+                mission.pause_mission();
+                action.land();
+                action.disarm();
+                break;
+            }
             sleep_for(seconds(1));
         }
+
+        // we will see if clearing the mission allow us to run 
+        // for longer
+        // This does not seem to work because it switches out of mission mode
+        //mission.clear_mission();
+
+
+        // TRY TO SEE IF WE CAN AVOID GOING TO THE BASE POSITION. THIS IS POLLUTING THE RESULTS.
+        // We will return to the launch position if we cannot control the direction in the random walk
+        //
+        // Action::Result return_to_first = action.goto_location(initial_position.latitude_deg, initial_position.longitude_deg,10.0,0);
+        // if (return_to_first != Action::Result::Success){
+        //     std::cout << "Failed to return to first location "<< return_to_first << "\n";
+        // }
+
+        // Telemetry::Position pos = telemetry.position();
+        // while (haversineDistance(pos.latitude_deg, pos.longitude_deg, initial_position.latitude_deg,initial_position.longitude_deg) > 2.0 && keepRunning){
+        //     sleep_for(seconds(1));
+        //     pos = telemetry.position();
+        // }
+
+        // prevPoint.lat = initial_position.latitude_deg;
+        // prevPoint.lon = initial_position.longitude_deg;
 
     }
 
     // Done. Land in place
     std::cout << "Commanding Land...\n";
-    const Action::Result rtl_result = action.land(); 
+    Action::Result rtl_result = action.return_to_launch(); //action.land(); 
     if (rtl_result != Action::Result::Success) {
-        std::cout << "Failed to command Land: " << rtl_result << '\n';
-        return 1;
+        std::cout << "Failed to command return to launch: " << rtl_result << '\n';
+        return -1;
     }
     std::cout << "Commanded Land.\n";
 
     // We need to wait a bit, otherwise the armed state might not be correct yet.
     sleep_for(seconds(2));
 
-    while (telemetry.armed()) {
+    while(telemetry.landed_state() != Telemetry::LandedState::OnGround && keepRunning){
+        sleep_for(seconds(1));
+    }
+
+    sleep_for(seconds(2));
+
+    rtl_result = action.disarm();
+
+    if (rtl_result != Action::Result::Success) {
+        std::cout << "Failed to disarm: " << rtl_result << '\n';
+    }
+
+    while (telemetry.armed() && keepRunning) {
         // Wait until we're done.
         sleep_for(seconds(1));
     }
-    std::cout << "Disarmed, exiting.\n";
+    std::cout << "Disarmed, clearing mission\n";
+
+    //mission.clear_mission();
+
+    sleep_for(seconds(1));
+
+    if (params.shutdown){
+        //shell.send("shutdown");
+        std::cout << "Shutting down drone\n";
+        action.shutdown();
+        sleep_for(seconds(1));
+    }
+
+    std::cout << "Mission cleared. Existing\n";
+
 }
