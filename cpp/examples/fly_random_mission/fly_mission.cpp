@@ -145,7 +145,7 @@ Mission::MissionItem make_mission_item(
 
 void usage(const std::string& bin_name)
 {
-    std::cerr << "Usage : " << bin_name << " <connection_url>  [missionrounds=<int> roundlength=<int> addlanding=y maxturnshift=<degrees>]\n"
+    std::cerr << "Usage : " << bin_name << " <connection_url>  [missionrounds=<int>] [roundlength=<int>] [addlanding=y] [maxturnshift=<degrees>] [distance=<double meters>]\n"
               << "Connection URL format should be :\n"
               << " For TCP server: tcpin://<our_ip>:<port>\n"
               << " For TCP client: tcpout://<remote_ip>:<port>\n"
@@ -161,6 +161,7 @@ struct params_t {
     bool addlanding;
     int maxturnshift;
     bool shutdown;
+    double distance_forward;
 } params;
 
 int main(int argc, char** argv)
@@ -170,6 +171,7 @@ int main(int argc, char** argv)
     params.addlanding = false;
     params.maxturnshift = 30;
     params.shutdown = false;
+    params.distance_forward = 20.0;
 
     if (argc < 2) {
         usage(argv[0]);
@@ -193,6 +195,8 @@ int main(int argc, char** argv)
                     params.maxturnshift = atoi(value);
                 } else if (std::strcmp(name,"shutdown")==0){
                     params.shutdown= true;
+                } else if (std::strcmp(name,"distance")==0){
+                    params.distance_forward = atof(value);
                 }
             }
         }
@@ -216,7 +220,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
+    Mavsdk::Configuration config{ComponentType::GroundStation};
+    config.set_always_send_heartbeats(true);
+    Mavsdk mavsdk{config};
+    mavsdk.set_timeout_s(2.0);
+    mavsdk.set_heartbeat_timeout_s(10.0);
+
     ConnectionResult connection_result = mavsdk.add_any_connection(argv[1]);
 
     if (connection_result != ConnectionResult::Success) {
@@ -275,6 +284,49 @@ int main(int argc, char** argv)
     } else {
         std::cerr << "Failed to set parameter: " << result << '\n';
     }
+
+    /***************
+     * RESET THE MAGNETOMETER CALIBRATION TO AVOID GETTING OUT OF SYNC 
+     * 
+     */
+
+    result = param.set_param_float("CAL_MAG0_XOFF",0);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_XOFF \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+    result = param.set_param_float("CAL_MAG0_YOFF",0);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_YOFF \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+    result = param.set_param_float("CAL_MAG0_ZOFF",0);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_ZOFF \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+    result = param.set_param_float("CAL_MAG0_XSCALE",1);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_XSCALE \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+    result = param.set_param_float("CAL_MAG0_YSCALE",1);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_YSCALE \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+    result = param.set_param_float("CAL_MAG0_ZSCALE",1);
+    if (result == Param::Result::Success) {
+        std::cout << "Successfully resetting CAL_MAG0_ZSCALE \n";
+    } else {
+        std::cerr << "Failed to set parameter: " << result << '\n';
+    }
+
 
     // ALLOW ARMING WITHOUT GPS
     // result = param.set_param_int("COM_ARM_WO_GPS",1);
@@ -367,7 +419,7 @@ int main(int argc, char** argv)
 
     for (int j=0;j<params.missionrounds && keepRunning;j++){
 
-        std::cout << "Mission round: " << j <<"\n";
+        std::cout << "Mission round: " << j << " for angle: "<< params.maxturnshift <<"\n";
 
         mission_items.clear();
 
@@ -421,7 +473,7 @@ int main(int argc, char** argv)
             nextPoint = project_point(
                 prevPoint.lat, 
                 prevPoint.lon, 
-                20.0 , // meter forward
+                params.distance_forward, //20.0 , // meter forward
                 direction
             );
             prevPoint = nextPoint;
@@ -433,12 +485,20 @@ int main(int argc, char** argv)
         Mission::MissionPlan mission_plan{};
         mission_plan.mission_items = mission_items;
 
-        const Mission::Result upload_result = mission.upload_mission(mission_plan);
+        Mission::Result upload_result;// = mission.upload_mission(mission_plan);
+        int mission_load_tries=0;
 
-        if (upload_result != Mission::Result::Success) {
-            std::cerr << "Mission upload failed: " << upload_result << ", exiting.\n";
-            return -1;
+        while ((upload_result = mission.upload_mission(mission_plan)) != Mission::Result::Success) {
+            std::cerr << "Mission upload failed: " << upload_result << ", retrying.\n";
+            mission_load_tries ++;
+            sleep_for(seconds(1));
+            if (mission_load_tries > 5){
+                std::cerr << "Mission upload failed: " << upload_result << ", exiting.\n";
+                return -1;
+            }
         }
+
+        std::cerr << "Mission loaded\n";
 
         if (first_time){
             first_time = false;
@@ -461,10 +521,18 @@ int main(int argc, char** argv)
         }
 
         Mission::Result start_mission_result = mission.start_mission();
-        if (start_mission_result != Mission::Result::Success) {
-            std::cerr << "Starting mission failed: " << start_mission_result << '\n';
-            return -1;
+        int mission_start_retries = 0;
+        while (start_mission_result != Mission::Result::Success) {
+            std::cerr << "Starting mission failed: " << start_mission_result << " retrying\n";
+            mission_start_retries ++;
+            if (mission_start_retries > 5){
+                std::cerr << "Starting mission failed: " << start_mission_result << " exiting\n";
+                return -1;
+            }
+            start_mission_result = mission.start_mission();
         }
+
+        std::cerr << "Mission started\n";
 
         while (!mission.is_mission_finished().second) {
             if (!keepRunning){
